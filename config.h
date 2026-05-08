@@ -72,8 +72,6 @@ extern int NumBucket;
 extern bool Enable_Long_Txn; // 是否启用长事务
 extern int Long_Txn_Length; // 长事务的长度
 extern double Key_Page_Map_Cache_Ratio; // 能缓存key-page映射的比例, 0.0-1.0
-extern int Split2PCHotKeyThreshold; // SYSTEM_MODE 101: hot key access count must be greater than this to use 2PC
-extern int Split2PCHotKeyTopN; // SYSTEM_MODE 101: top-N Zipfian keys treated as hot; -1 means all accounts
 
 // for TPC-C
 extern int TPCC_WAREHOUSE_NUM;

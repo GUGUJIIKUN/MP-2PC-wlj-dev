@@ -569,41 +569,6 @@ public:
         }
     };
 
-    inline void update_key_page_for_subtxn(TxnQueueEntry* txn, table_id_t table_id, itemkey_t key, bool rw,
-            page_id_t ctid_ret_page, node_id_t routed_node_id, size_t action_idx) {
-        if (txn->accessed_page_ids.size() == 0 || action_idx >= txn->accessed_page_ids.size()) return;
-        page_id_t original_page = txn->accessed_page_ids[action_idx];
-        stats_.page_update_cnt++;
-        if(original_page == ctid_ret_page) {
-            ownership_table_->set_owner(txn, table_id, key, rw, original_page, routed_node_id);
-        }
-        else if (original_page == -1) {
-            ownership_table_->set_owner(txn, table_id, key, rw, ctid_ret_page, routed_node_id);
-            insert_or_victim_hot(table_id, key, ctid_ret_page);
-        }
-        else {
-            ownership_table_->set_owner(txn, table_id, key, rw, ctid_ret_page, routed_node_id);
-            ownership_table_->set_owner(txn, table_id, key, rw, original_page, routed_node_id);
-            if(enable_hot_update == false) return;
-            std::unique_lock<std::shared_mutex> lock(hot_mutex_);
-            auto it = hot_key_map.find({table_id, key});
-            if (it != hot_key_map.end()) {
-                if(enable_hot_update) it->second.page = ctid_ret_page;
-                it->second.last_access_time = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()
-                    ).count()
-                );
-                stats_.change_page_cnt++;
-            #if LOG_PAGE_UPDATE
-                logger->info("txn_type: " + std::to_string(txn->txn_type) + " Key (table_id=" + std::to_string(table_id) +
-                                ", key=" + std::to_string(key) + ") page changed from " + std::to_string(original_page) +
-                                " to " + std::to_string(ctid_ret_page) + " at node " + std::to_string(routed_node_id));
-            #endif
-            }
-        }
-    };
-
     // init key-page mapping when load data
     inline void initial_key_page(table_id_t table_id, itemkey_t key, page_id_t page) {
     #if !MLP_PREDICTION
