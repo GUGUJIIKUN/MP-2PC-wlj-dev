@@ -20,6 +20,9 @@
 #include <tuple>
 #include <sstream>
 #include <stdexcept>
+#include <set>
+#include <unordered_set>
+#include <algorithm>
 
 #include "smallbank.h"
 #include "ycsb.h"
@@ -616,10 +619,152 @@ struct SubTxnAction {
     std::string sub_gid;
 };
 
-struct SplitWritePage {
-    table_id_t table_id = 0;
-    itemkey_t key = 0;
-    page_id_t page_id = kInvalidPageId;
+class SingleTxnConnectionPool {
+public:
+    explicit SingleTxnConnectionPool(int node_count) : idle_conns_(node_count) {}
+
+    std::unique_ptr<pqxx::connection> borrow(node_id_t node_id) {
+        auto& idle = idle_conns_.at(node_id);
+        while (!idle.empty()) {
+            auto conn = std::move(idle.back());
+            idle.pop_back();
+            if (conn && conn->is_open()) {
+                return conn;
+            }
+        }
+        return std::make_unique<pqxx::connection>(DBConnection[node_id]);
+    }
+
+    void release(node_id_t node_id, std::unique_ptr<pqxx::connection> conn) {
+        if (conn && conn->is_open()) {
+            idle_conns_.at(node_id).push_back(std::move(conn));
+        }
+    }
+
+private:
+    std::vector<std::vector<std::unique_ptr<pqxx::connection>>> idle_conns_;
+};
+
+static std::unordered_set<itemkey_t> build_zipfian_top_hot_keys(
+    int account_count,
+    int top_n
+) {
+    std::unordered_set<itemkey_t> hot_keys;
+    if (account_count <= 0 || top_n == 0) {
+        return hot_keys;
+    }
+
+    if (top_n < 0) {
+        return hot_keys;
+    }
+
+    const int bucket_count = std::max(1, NumBucket);
+    const int bucket_size = std::max(1, account_count / bucket_count);
+    const int max_keys = std::min(top_n, account_count);
+    hot_keys.reserve(static_cast<std::size_t>(max_keys) * 2);
+
+    int inserted_accounts = 0;
+    for (int rank = 0; rank < bucket_size && inserted_accounts < max_keys; ++rank) {
+        for (int bucket = 0; bucket < bucket_count && inserted_accounts < max_keys; ++bucket) {
+            const itemkey_t account_id = static_cast<itemkey_t>(bucket * bucket_size + rank + 1);
+            if (account_id > static_cast<itemkey_t>(account_count)) {
+                continue;
+            }
+            hot_keys.insert(account_id);
+            ++inserted_accounts;
+        }
+    }
+    for (int account = 1; inserted_accounts < max_keys && account <= account_count; ++account) {
+        if (hot_keys.insert(static_cast<itemkey_t>(account)).second) {
+            ++inserted_accounts;
+        }
+    }
+
+    return hot_keys;
+}
+
+static int count_hot_key_accesses(
+    const std::vector<itemkey_t>& keys,
+    const std::unordered_set<itemkey_t>& hot_keys,
+    bool all_keys_are_hot
+) {
+    std::unordered_set<itemkey_t> unique_hot_keys;
+    for (itemkey_t key : keys) {
+        if (all_keys_are_hot || hot_keys.find(key) != hot_keys.end()) {
+            unique_hot_keys.insert(key);
+        }
+    }
+    return static_cast<int>(unique_hot_keys.size());
+}
+
+static std::string build_smallbank_sp_sql(
+    int txn_type,
+    itemkey_t account1,
+    itemkey_t account2,
+    const std::vector<itemkey_t>& keys
+) {
+    switch (txn_type) {
+        case 0:
+            return "SELECT rel, id, ctid, balance, txid FROM sp_amalgamate(" +
+                   std::to_string(account1) + "," + std::to_string(account2) + ")";
+        case 1:
+            return "SELECT rel, id, ctid, balance, txid FROM sp_send_payment(" +
+                   std::to_string(account1) + "," + std::to_string(account2) + ")";
+        case 2:
+            return "SELECT rel, id, ctid, balance, txid FROM sp_deposit_checking(" +
+                   std::to_string(account1) + ")";
+        case 3:
+            return "SELECT rel, id, ctid, balance, txid FROM sp_write_check(" +
+                   std::to_string(account1) + ")";
+        case 4:
+            return "SELECT rel, id, ctid, balance, txid FROM sp_balance(" +
+                   std::to_string(account1) + ")";
+        case 5:
+            return "SELECT rel, id, ctid, balance, txid FROM sp_transact_savings(" +
+                   std::to_string(account1) + ")";
+        case 6: {
+            std::string ids_str = "array[";
+            for (size_t i = 0; i < keys.size(); ++i) {
+                ids_str += std::to_string(keys[i]);
+                if (i + 1 < keys.size()) {
+                    ids_str += ",";
+                }
+            }
+            ids_str += "]";
+            return "SELECT rel, id, ctid, balance, txid FROM sp_multi_update(" +
+                   ids_str + ", 1)";
+        }
+        default:
+            return "";
+    }
+}
+
+static std::vector<page_id_t> parse_pages_from_result(const pqxx::result& res) {
+    std::vector<page_id_t> ctid_ret_page_ids;
+    ctid_ret_page_ids.reserve(res.size());
+    for (const auto& row : res) {
+        std::string ctid_str = row["ctid"].as<std::string>();
+        auto [page_id, tuple_index] = parse_page_id_from_ctid(ctid_str);
+        ctid_ret_page_ids.push_back(page_id);
+    }
+    return ctid_ret_page_ids;
+}
+
+static void update_key_page_for_action(
+    SmartRouter* smart_router,
+    TxnQueueEntry* txn_entry,
+    const SubTxnAction& action,
+    size_t action_idx,
+    const std::vector<page_id_t>& ctid_ret_page_ids,
+    node_id_t routed_node_id
+) {
+    if (!smart_router || ctid_ret_page_ids.empty()) {
+        return;
+    }
+
+    smart_router->update_key_page_for_subtxn(txn_entry, action.table_id, action.key,
+                                             action.is_write, ctid_ret_page_ids.front(),
+                                             routed_node_id, action_idx);
 };
 
 static bool build_smallbank_split_actions(
@@ -700,6 +845,272 @@ static bool build_smallbank_split_actions(
     }
 }
 
+static void execute_smallbank_multiwrite_sp(
+    pqxx::connection* con,
+    SmartRouter* smart_router,
+    TxnQueueEntry* txn_entry,
+    int txn_type,
+    itemkey_t account1,
+    itemkey_t account2,
+    const std::vector<table_id_t>& tables,
+    const std::vector<itemkey_t>& keys,
+    const std::vector<bool>& rw,
+    node_id_t compute_node_id
+) {
+    pqxx::nontransaction txn(*con);
+    pqxx::result res = txn.exec(build_smallbank_sp_sql(txn_type, account1, account2, keys));
+    std::vector<page_id_t> ctid_ret_page_ids = parse_pages_from_result(res);
+    if (smart_router) {
+        auto tables_copy = tables;
+        auto keys_copy = keys;
+        auto rw_copy = rw;
+        smart_router->update_key_page(txn_entry, tables_copy, keys_copy, rw_copy,
+                                      ctid_ret_page_ids, compute_node_id);
+    }
+}
+
+static void execute_smallbank_split_direct_commit(
+    std::vector<std::unique_ptr<pqxx::connection>>& node_conns,
+    SmartRouter* smart_router,
+    TxnQueueEntry* txn_entry,
+    const std::vector<SubTxnAction>& actions,
+    const std::vector<node_id_t>& participants,
+    tx_id_t tx_id,
+    Logger* logger_
+) {
+    assert(actions.size() == participants.size());
+    std::set<node_id_t> participant_nodes(participants.begin(), participants.end());
+    std::vector<std::vector<page_id_t>> action_pages(actions.size());
+    std::map<node_id_t, std::unique_ptr<pqxx::nontransaction>> txns;
+
+    try {
+        for (node_id_t node_id : participant_nodes) {
+            auto txn = std::make_unique<pqxx::nontransaction>(*node_conns[node_id]);
+            txn->exec("BEGIN");
+            txns.emplace(node_id, std::move(txn));
+        }
+
+        for (size_t i = 0; i < actions.size(); ++i) {
+            const auto& action = actions[i];
+            node_id_t participant_node_id = participants[i];
+            struct timespec sub_start_time, sub_end_time;
+            clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
+            pqxx::result res = txns.at(participant_node_id)->exec(action.sql);
+            clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
+            action_pages[i] = parse_pages_from_result(res);
+            logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) +
+                          " directly executed on node " + std::to_string(participant_node_id) +
+                          " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
+                          (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
+        }
+
+        for (node_id_t node_id : participant_nodes) {
+            txns.at(node_id)->exec("COMMIT");
+        }
+
+        for (size_t i = 0; i < actions.size(); ++i) {
+            update_key_page_for_action(smart_router, txn_entry, actions[i], i, action_pages[i], participants[i]);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Split direct commit failed for txn " << tx_id << ": " << e.what() << std::endl;
+        logger_->info("Split direct commit failed for txn " + std::to_string(tx_id) + ": " + std::string(e.what()));
+        for (node_id_t node_id : participant_nodes) {
+            try {
+                auto it = txns.find(node_id);
+                if (it != txns.end()) {
+                    it->second->exec("ROLLBACK");
+                }
+            } catch (const std::exception& rollback_e) {
+                logger_->info("Split direct rollback failed on node " + std::to_string(node_id) +
+                              " for txn " + std::to_string(tx_id) + ": " + std::string(rollback_e.what()));
+            }
+        }
+    }
+}
+
+static void execute_smallbank_split_2pc(
+    std::vector<std::unique_ptr<pqxx::connection>>& node_conns,
+    SingleTxnConnectionPool& single_conn_pool,
+    SmartRouter* smart_router,
+    TxnQueueEntry* txn_entry,
+    const std::vector<SubTxnAction>& actions,
+    const std::vector<node_id_t>& participants,
+    tx_id_t tx_id,
+    bool use_custom_2pc,
+    Logger* logger_
+) {
+    assert(actions.size() == participants.size());
+    const std::string global_gid = "tx_" + std::to_string(tx_id);
+    txn_entry->is_distributed = true;
+    txn_entry->distributed_global_state.txn_str = global_gid;
+    txn_entry->distributed_global_state.participant_nodes = static_cast<int>(
+        std::set<node_id_t>(participants.begin(), participants.end()).size());
+    txn_entry->distributed_global_state.status = DistributedTxnStatus::INIT;
+    txn_entry->distributed_branch_states.clear();
+
+    bool can_commit = true;
+    std::vector<std::vector<page_id_t>> action_pages(actions.size());
+    std::vector<std::unique_ptr<pqxx::connection>> single_prepared_conns(actions.size());
+
+    for (size_t i = 0; i < actions.size(); ++i) {
+        node_id_t participant_node_id = participants[i];
+        const auto& action = actions[i];
+        DistributedTxnBranchState branch_state;
+        branch_state.branch_id = static_cast<int>(i);
+        branch_state.node_id = participant_node_id;
+        branch_state.branch_txn_str = action.sub_gid;
+        txn_entry->distributed_branch_states.push_back(branch_state);
+
+        bool prepare_ok = false;
+        pqxx::connection* branch_conn = nullptr;
+        try {
+            struct timespec sub_start_time, sub_end_time;
+            if (use_custom_2pc) {
+                single_prepared_conns[i] = single_conn_pool.borrow(participant_node_id);
+                if (!single_prepared_conns[i]->is_open()) {
+                    throw std::runtime_error("Failed to connect to database: " + DBConnection[participant_node_id]);
+                }
+                branch_conn = single_prepared_conns[i].get();
+            } else {
+                branch_conn = node_conns[participant_node_id].get();
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
+            pqxx::nontransaction txn(*branch_conn);
+            txn.exec("BEGIN");
+            pqxx::result res = txn.exec(action.sql);
+            clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
+            logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) +
+                          " executed on node " + std::to_string(participant_node_id) +
+                          " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
+                          (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
+
+            clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
+            if (use_custom_2pc) {
+                txn.exec("PREPARE SINGLE TRANSACTION '" + action.sub_gid + "'");
+            } else {
+                txn.exec("PREPARE TRANSACTION '" + action.sub_gid + "'");
+            }
+            clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
+            prepare_ok = true;
+            txn_entry->distributed_branch_states.back().status = DistributedTxnStatus::PREPARED;
+            logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) +
+                          " prepared on node " + std::to_string(participant_node_id) +
+                          " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
+                          (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
+            try {
+                action_pages[i] = parse_pages_from_result(res);
+            } catch (const std::exception& parse_e) {
+                logger_->info("Post-prepare bookkeeping failed on node " + std::to_string(participant_node_id) +
+                              " for action " + std::to_string(i) + ": " + std::string(parse_e.what()));
+            }
+        } catch (const std::exception& e) {
+            if (!prepare_ok) {
+                txn_entry->distributed_branch_states.back().status = DistributedTxnStatus::ABORTED;
+                can_commit = false;
+                try {
+                    if (branch_conn != nullptr && branch_conn->is_open()) {
+                        pqxx::nontransaction txn(*branch_conn);
+                        txn.exec("ROLLBACK");
+                    }
+                } catch (...) {
+                }
+                if (use_custom_2pc) {
+                    single_conn_pool.release(participant_node_id, std::move(single_prepared_conns[i]));
+                }
+            }
+            std::cerr << "Sub-transaction execution failed on node " << participant_node_id
+                      << " for action " << i << ": " << e.what() << std::endl;
+            logger_->info("Sub-transaction execution failed on node " + std::to_string(participant_node_id) +
+                          " for action " + std::to_string(i) + ": " + std::string(e.what()));
+            if (!prepare_ok) {
+                break;
+            }
+        }
+    }
+
+    struct timespec log_time_start, log_time_end;
+    clock_gettime(CLOCK_MONOTONIC, &log_time_start);
+    std::string log_msg = "GlobalGid: " + global_gid + " Status: " + (can_commit ? "COMMIT" : "ABORT");
+    smart_router->log_prepare_result(log_msg);
+    clock_gettime(CLOCK_MONOTONIC, &log_time_end);
+    logger_->info("Txn id: " + std::to_string(tx_id) + " logged prepare result in " +
+                  std::to_string((log_time_end.tv_sec - log_time_start.tv_sec) * 1000.0 +
+                  (log_time_end.tv_nsec - log_time_start.tv_nsec) / 1000000.0) + " ms");
+
+    if (can_commit) {
+        for (size_t i = 0; i < actions.size(); ++i) {
+            node_id_t participant_node_id = participants[i];
+            assert(txn_entry->distributed_branch_states[i].status == DistributedTxnStatus::PREPARED);
+            try {
+                struct timespec sub_start_time, sub_end_time;
+                pqxx::connection* commit_conn = use_custom_2pc ?
+                    single_prepared_conns[i].get() : node_conns[participant_node_id].get();
+                assert(commit_conn != nullptr);
+                clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
+                pqxx::nontransaction txn(*commit_conn);
+                if (use_custom_2pc) {
+                    txn.exec("COMMIT SINGLE PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'");
+                } else {
+                    txn.exec("COMMIT PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'");
+                }
+                clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
+                txn_entry->distributed_branch_states[i].status = DistributedTxnStatus::COMMITTED;
+                update_key_page_for_action(smart_router, txn_entry, actions[i], i, action_pages[i], participant_node_id);
+                logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) +
+                              " committed on node " + std::to_string(participant_node_id) +
+                              " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
+                              (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
+                if (use_custom_2pc) {
+                    single_conn_pool.release(participant_node_id, std::move(single_prepared_conns[i]));
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Sub-transaction commit failed on node " << participant_node_id
+                          << " for action " << i << ": " << e.what() << std::endl;
+                logger_->info("Sub-transaction commit failed on node " + std::to_string(participant_node_id) +
+                              " for action " + std::to_string(i) + ": " + std::string(e.what()));
+            }
+        }
+        txn_entry->distributed_global_state.status = DistributedTxnStatus::COMMITTED;
+        return;
+    }
+
+    for (size_t i = 0; i < txn_entry->distributed_branch_states.size(); ++i) {
+        node_id_t participant_node_id = participants[i];
+        if (txn_entry->distributed_branch_states[i].status != DistributedTxnStatus::PREPARED) {
+            continue;
+        }
+        try {
+            struct timespec sub_start_time, sub_end_time;
+            pqxx::connection* rollback_conn = use_custom_2pc ?
+                single_prepared_conns[i].get() : node_conns[participant_node_id].get();
+            assert(rollback_conn != nullptr);
+            clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
+            pqxx::nontransaction txn(*rollback_conn);
+            if (use_custom_2pc) {
+                txn.exec("ROLLBACK SINGLE PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'");
+            } else {
+                txn.exec("ROLLBACK PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'");
+            }
+            clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
+            txn_entry->distributed_branch_states[i].status = DistributedTxnStatus::ABORTED;
+            logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) +
+                          " rolled back on node " + std::to_string(participant_node_id) +
+                          " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
+                          (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
+            if (use_custom_2pc) {
+                single_conn_pool.release(participant_node_id, std::move(single_prepared_conns[i]));
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Sub-transaction rollback failed on node " << participant_node_id
+                      << " for action " << i << ": " << e.what() << std::endl;
+            logger_->info("Sub-transaction rollback failed on node " + std::to_string(participant_node_id) +
+                          " for action " + std::to_string(i) + ": " + std::string(e.what()));
+        }
+    }
+    txn_entry->distributed_global_state.status = DistributedTxnStatus::ABORTED;
+}
+
 void run_smallbank_txns_sp_split_2pc(thread_params* params, Logger* logger_) {
     assert(SYSTEM_MODE == 101);
     // 设置线程名
@@ -733,6 +1144,14 @@ void run_smallbank_txns_sp_split_2pc(thread_params* params, Logger* logger_) {
             exit(-1);
         }
     }
+    SingleTxnConnectionPool single_conn_pool(ComputeNodeCount);
+    const bool split_2pc_all_keys_hot = (Split2PCHotKeyTopN < 0);
+    const auto split_2pc_hot_keys = build_zipfian_top_hot_keys(smallbank->get_account_count(), Split2PCHotKeyTopN);
+    std::cout << "SYSTEM_MODE 101 hot-key 2PC policy: threshold="
+              << Split2PCHotKeyThreshold << ", top_n=" << Split2PCHotKeyTopN
+              << ", materialized_hot_keys="
+              << (split_2pc_all_keys_hot ? std::string("all") : std::to_string(split_2pc_hot_keys.size()))
+              << std::endl;
 
     int con_batch_id = 0;
     while (true) {
@@ -789,7 +1208,7 @@ void run_smallbank_txns_sp_split_2pc(thread_params* params, Logger* logger_) {
             tx_id_t tx_id = txn_entry->tx_id;
             int txn_type = txn_entry->txn_type;
             itemkey_t account1 = txn_entry->accounts[0];
-            itemkey_t account2 = txn_entry->accounts[1];
+            itemkey_t account2 = txn_entry->accounts.size() > 1 ? txn_entry->accounts[1] : account1;
 
             while (!con->is_open()) {
                 con = std::make_unique<pqxx::connection>(con_str);
@@ -822,25 +1241,9 @@ void run_smallbank_txns_sp_split_2pc(thread_params* params, Logger* logger_) {
                 // 根据事务的类型，拆分为具体的子事务，存在 actions 里面
                 bool split_enabled = build_smallbank_split_actions(tx_id, txn_type, account1, account2, keys, &actions, &fallback_sql);
 
-
-                // 如果是无法拆分的事务，那就按照正常流程走
                 if (!split_enabled) {
-                    // 执行 SQL
-                    pqxx::nontransaction txn(*con);
-                    pqxx::result res = txn.exec(fallback_sql);
-
-                    // 记录这个事务要访问的页面数量总和
-                    std::vector<page_id_t> ctid_ret_page_ids;
-                    for (const auto& row : res){
-                        // ctid：(page_id , slot_no)：指示这个记录在哪个页面上的哪个记录处
-                        std::string ctid_str = row["ctid"].as<std::string>();
-                        auto [page_id, tuple_index] = parse_page_id_from_ctid(ctid_str);
-                        ctid_ret_page_ids.push_back(page_id);
-                    }
-                    if (smart_router) {
-                        smart_router->update_key_page(txn_entry, const_cast<std::vector<table_id_t>&>(tables),
-                                                      keys, rw, ctid_ret_page_ids, compute_node_id);
-                    }
+                    execute_smallbank_multiwrite_sp(con.get(), smart_router, txn_entry, txn_type,
+                                                    account1, account2, tables, keys, rw, compute_node_id);
                     timespec mark_done_start_time, mark_done_end_time;
                     clock_gettime(CLOCK_MONOTONIC, &mark_done_start_time);
                     tit->mark_done(txn_entry, call_id);
@@ -869,7 +1272,6 @@ void run_smallbank_txns_sp_split_2pc(thread_params* params, Logger* logger_) {
                 // 当某个 key 还没有任何 ctid 记录或 owner 信息（典型情况：刚启动、第一次访问该 key）
                 // 时，退化到原来的 `key * 9973 % ComputeNodeCount` hash 路由，保证总能选出一个节点。
                 std::vector<node_id_t> participants;
-                bool has_write = false;
                 assert(txn_entry->accessed_page_ids.size() == 0);
                 for (const auto& action : actions) {
                     node_id_t node = smart_router->route_subtxn_by_tuple_location(action.table_id, action.key);
@@ -878,160 +1280,23 @@ void run_smallbank_txns_sp_split_2pc(thread_params* params, Logger* logger_) {
                         node = static_cast<node_id_t>((action.key * 9973ULL) % ComputeNodeCount);
                     }
                     participants.push_back(node);
-                    has_write = has_write || action.is_write;
                 }
                 assert(participants.size() == actions.size());
 
-                const std::string global_gid = "tx_" + std::to_string(tx_id); 
-                // ! 设置事务全局状态为 INIT
-                txn_entry->is_distributed = true; 
-                txn_entry->distributed_global_state.txn_str = global_gid;
-                txn_entry->distributed_global_state.status = DistributedTxnStatus::INIT;
-                bool can_commit = true; // 记录是否所有分支都成功执行，最终由协调者根据这个值和其他信息决定提交还是中止事务
-
-                //  计时
-                for(int i = 0; i < participants.size(); i++) {
-                    node_id_t participant_node_id = participants[i];
-                    const auto& action = actions[i];
-                    DistributedTxnBranchState branch_state;
-                    branch_state.branch_id = i;
-                    branch_state.node_id = participant_node_id;
-                    branch_state.branch_txn_str = action.sub_gid;
-                    txn_entry->distributed_branch_states.push_back(branch_state);
-                    pqxx::result res;
-                    bool prepare_ok = false;
-                    try {
-                        // 计时
-                        struct timespec sub_start_time, sub_end_time;
-                        clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
-                        // 用 nontransaction 包裹，避免 pqxx::work 析构时自动发出 ROLLBACK，
-                        // 否则在 PREPARE [SINGLE] TRANSACTION 之后会跟一条多余的 ROLLBACK，
-                        // 对自定义 PREPARE SINGLE TRANSACTION 而言会真的把刚 PREPARE 的子事务回滚掉。
-                        pqxx::nontransaction txn(*node_conns[participant_node_id]);
-                        txn.exec("BEGIN");
-                        res = txn.exec(action.sql);
-                        clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
-                        logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) + " executed on node " + 
-                                      std::to_string(participant_node_id) + " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
-                                       (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
-                        
-                        // 计时
-                        clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
-                        if (params->use_custom_2pc) {
-                            txn.exec("PREPARE SINGLE TRANSACTION '" + action.sub_gid + "'");
-                        } else {
-                            txn.exec("PREPARE TRANSACTION '" + action.sub_gid + "'");
-                        }
-                        clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
-                        // PREPARE 一旦返回成功，立即把分支状态置为 PREPARED，
-                        // 防止后续辅助动作（如 update_key_page）抛异常时把分支误标为 ABORTED，
-                        // 进而被 rollback 循环跳过、在节点上留下孤儿 prepared 子事务。
-                        prepare_ok = true;
-                        txn_entry->distributed_branch_states.back().status = DistributedTxnStatus::PREPARED;
-                        logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) + " prepared on node " + 
-                                      std::to_string(participant_node_id) + " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
-                                       (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
-                    } catch (const std::exception &e) {
-                        if (!prepare_ok) {
-                            txn_entry->distributed_branch_states.back().status = DistributedTxnStatus::ABORTED;
-                            can_commit = false; // 只要有一个分支执行失败，整个事务就不能提交
-                        }
-                        std::cerr << "Sub-transaction execution failed on node " << participant_node_id 
-                                  << " for action " << i << ": " << e.what() << std::endl;
-                        logger_->info("Sub-transaction execution failed on node " + std::to_string(participant_node_id) + 
-                                      " for action " + std::to_string(i) + ": " + std::string(e.what()));
-                        if (!prepare_ok) {
-                            break; // 该分支执行失败，继续执行其他分支，最终由协调者决定事务结果
-                        }
+                const int hot_key_access_count = count_hot_key_accesses(keys, split_2pc_hot_keys, split_2pc_all_keys_hot);
+                const bool should_use_2pc = hot_key_access_count > Split2PCHotKeyThreshold;
+                const std::set<node_id_t> participant_node_set(participants.begin(), participants.end());
+                if (!should_use_2pc || participant_node_set.size() <= 1) {
+                    if (should_use_2pc && participant_node_set.size() <= 1) {
+                        logger_->info("Txn id: " + std::to_string(tx_id) +
+                                      " has hot_key_count=" + std::to_string(hot_key_access_count) +
+                                      " but only visits one node; skip prepare and direct commit.");
                     }
-                    // 只有 PREPARE 成功了，才更新 ctid/page 映射；这部分即使抛异常也不影响 PREPARED 状态。
-                    if (prepare_ok) {
-                        try {
-                            std::vector<page_id_t> ctid_ret_page_ids;
-                            for (const auto& row : res) {
-                                std::string ctid_str = row["ctid"].as<std::string>();
-                                auto [page_id, tuple_index] = parse_page_id_from_ctid(ctid_str);
-                                ctid_ret_page_ids.push_back(page_id);
-                            }
-                            if (smart_router) {
-                                smart_router->update_key_page(txn_entry, const_cast<std::vector<table_id_t>&>(tables),
-                                                              keys, rw, ctid_ret_page_ids, participant_node_id);
-                            }
-                        } catch (const std::exception &e) {
-                            std::cerr << "Post-prepare bookkeeping failed on node " << participant_node_id
-                                      << " for action " << i << ": " << e.what() << std::endl;
-                            logger_->info("Post-prepare bookkeeping failed on node " + std::to_string(participant_node_id) +
-                                          " for action " + std::to_string(i) + ": " + std::string(e.what()));
-                        }
-                    }
-                }
-                // ! write a log
-                struct timespec log_time_start, log_time_end;
-                clock_gettime(CLOCK_MONOTONIC, &log_time_start);
-                std::string log_msg = "GlobalGid: " + global_gid + " Status: " + (can_commit ? "COMMIT" : "ABORT");
-                // smart_router->log_prepare_result(log_msg); 
-                clock_gettime(CLOCK_MONOTONIC, &log_time_end);
-                logger_->info("Txn id: " + std::to_string(tx_id) + " logged prepare result in " + std::to_string((log_time_end.tv_sec - log_time_start.tv_sec) * 1000.0 +
-                                       (log_time_end.tv_nsec - log_time_start.tv_nsec) / 1000000.0) + " ms");
-
-                if(can_commit) {
-                    assert(txn_entry->distributed_branch_states.size() == participants.size());
-                    // ! 协调者决定提交事务
-                    for(int i = 0; i < participants.size(); i++) {
-                        node_id_t participant_node_id = participants[i];
-                        assert(txn_entry->distributed_branch_states[i].status == DistributedTxnStatus::PREPARED);
-                        try {
-                            struct timespec sub_start_time, sub_end_time;
-                            clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
-                            pqxx::nontransaction txn(*node_conns[participant_node_id]); 
-                            if (params->use_custom_2pc) {
-                                txn.exec("COMMIT SINGLE PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'"); 
-                            } else {
-                                txn.exec("COMMIT PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'"); 
-                            }
-                            clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
-                            logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) + " committed on node " + 
-                                          std::to_string(participant_node_id) + " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
-                                           (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
-                        } catch (const std::exception &e) {
-                            std::cerr << "Sub-transaction commit failed on node " << participant_node_id 
-                                      << " for action " << i << ": " << e.what() << std::endl;
-                            logger_->info("Sub-transaction commit failed on node " + std::to_string(participant_node_id) + 
-                                          " for action " + std::to_string(i) + ": " + std::string(e.what()));
-                        }
-                    }
-                    txn_entry->distributed_global_state.status = DistributedTxnStatus::COMMITTED;
+                    execute_smallbank_split_direct_commit(node_conns, smart_router, txn_entry, actions,
+                                                          participants, tx_id, logger_);
                 } else {
-                    // ! 协调者决定中止事务
-                    for(int i = 0; i < participants.size(); i++) { 
-                        node_id_t participant_node_id = participants[i];
-                        if (txn_entry->distributed_branch_states[i].status == DistributedTxnStatus::PREPARED) {
-                            try {
-                                struct timespec sub_start_time, sub_end_time;
-                                clock_gettime(CLOCK_MONOTONIC, &sub_start_time);
-                                pqxx::nontransaction txn(*node_conns[participant_node_id]); 
-                                if (params->use_custom_2pc) {
-                                    txn.exec("ROLLBACK SINGLE PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'"); 
-                                } else {
-                                    txn.exec("ROLLBACK PREPARED '" + txn_entry->distributed_branch_states[i].branch_txn_str + "'"); 
-                                }
-                                clock_gettime(CLOCK_MONOTONIC, &sub_end_time);
-                                logger_->info("Txn id: " + std::to_string(tx_id) + " Sub-txn " + std::to_string(i) + " rolled back on node " + 
-                                              std::to_string(participant_node_id) + " in " + std::to_string((sub_end_time.tv_sec - sub_start_time.tv_sec) * 1000.0 +
-                                               (sub_end_time.tv_nsec - sub_start_time.tv_nsec) / 1000000.0) + " ms");
-                            } catch (const std::exception &e) {
-                                std::cerr << "Sub-transaction rollback failed on node " << participant_node_id 
-                                          << " for action " << i << ": " << e.what() << std::endl;
-                                logger_->info("Sub-transaction rollback failed on node " + std::to_string(participant_node_id) + 
-                                              " for action " + std::to_string(i) + ": " + std::string(e.what()));
-                            }
-                        }
-                        else {
-                            // 该分支没有成功执行到 PREPARED 阶段，说明它的事务根本没有被正式注册到协调者那里，协调者不需要发送回滚命令给它，直接忽略即可
-                            continue;
-                        }
-                    }
-                    txn_entry->distributed_global_state.status = DistributedTxnStatus::ABORTED;
+                    execute_smallbank_split_2pc(node_conns, single_conn_pool, smart_router, txn_entry, actions,
+                                                participants, tx_id, params->use_custom_2pc, logger_);
                 }
             } catch (const std::exception &e) {
                 std::cerr << "Split transaction failed: " << e.what() << std::endl;
@@ -1818,6 +2083,8 @@ void print_usage(const char* program_name) {
     std::cout << "  --db-connection <conn_str>  Database connection string (can be specified multiple times)" << std::endl;
     std::cout << "  --unlogged                  Create unlogged tables instead of normal tables" << std::endl;
     std::cout << "  --custom-2pc                Use custom 2PC syntax" << std::endl;
+    std::cout << "  --split-2pc-hot-threshold <n> Use 2PC only when a txn touches more than n hot keys [default: 0]" << std::endl;
+    std::cout << "  --split-2pc-hot-topn <n>    Zipfian top-N account keys treated as hot; -1 means all keys [default: -1]" << std::endl;
     std::cout << "  --help                      Show this help message" << std::endl;
     std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
@@ -2361,6 +2628,34 @@ int main(int argc, char *argv[]) {
             use_custom_2pc = true;
             std::cout << "Custom 2PC syntax enabled." << std::endl;
         }
+        else if (arg == "--split-2pc-hot-threshold") {
+            if (i + 1 < argc) {
+                Split2PCHotKeyThreshold = std::stoi(argv[++i]);
+                if (Split2PCHotKeyThreshold < 0) {
+                    std::cerr << "Error: split 2PC hot threshold must be non-negative" << std::endl;
+                    return -1;
+                }
+                std::cout << "Split 2PC hot threshold set to: " << Split2PCHotKeyThreshold << std::endl;
+            } else {
+                std::cerr << "Error: --split-2pc-hot-threshold requires a value" << std::endl;
+                print_usage(argv[0]);
+                return -1;
+            }
+        }
+        else if (arg == "--split-2pc-hot-topn") {
+            if (i + 1 < argc) {
+                Split2PCHotKeyTopN = std::stoi(argv[++i]);
+                if (Split2PCHotKeyTopN < -1) {
+                    std::cerr << "Error: split 2PC hot top_n must be -1 or non-negative" << std::endl;
+                    return -1;
+                }
+                std::cout << "Split 2PC hot top_n set to: " << Split2PCHotKeyTopN << std::endl;
+            } else {
+                std::cerr << "Error: --split-2pc-hot-topn requires a value" << std::endl;
+                print_usage(argv[0]);
+                return -1;
+            }
+        }
         else if (arg == "--workload") {
             if (i + 1 < argc) {
                 std::string workload_name = argv[++i];
@@ -2814,6 +3109,8 @@ int main(int argc, char *argv[]) {
             std::cerr << "Error: SYSTEM_MODE 101 currently supports PostgreSQL (db-type 0) only." << std::endl;
             return -1;
         }
+        std::cout << "Split 2PC hot key threshold: " << Split2PCHotKeyThreshold << std::endl;
+        std::cout << "Split 2PC hot key top_n: " << Split2PCHotKeyTopN << std::endl;
     }
     
     if (access_pattern == 1) {
