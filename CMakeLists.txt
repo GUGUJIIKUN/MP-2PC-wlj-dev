@@ -3,7 +3,6 @@ cmake_minimum_required(VERSION 3.10)
 project(MP-Router)
 
 # option(LINK_SO "Whether are linked dynamically" ON)
-option(WITH_YASHANDB "Build YashanDB client support" ON)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result -fPIC")
 
@@ -24,48 +23,18 @@ include_directories($ENV{HOME}/local/include)
 link_directories($ENV{HOME}/local/lib)
 link_directories(/usr/lib/postgresql/14/lib)
 
-if (WITH_YASHANDB)
-    set(YASHANDB_ROOT "" CACHE PATH "YashanDB client installation root")
-    set(YASHANDB_INCLUDE_DIR "" CACHE PATH "YashanDB client include directory")
-    set(YASHANDB_LIBRARY "" CACHE FILEPATH "YashanDB yascli library")
+include_directories(/root/yashandb-client/include)
 
-    find_path(YASHANDB_INCLUDE_DIR
-        NAMES yacli.h
-        PATHS
-            ${YASHANDB_INCLUDE_DIR}
-            ${YASHANDB_ROOT}/include
-            /root/yashandb-client/include
-            /home/yashan/install/include
-        NO_DEFAULT_PATH
-    )
-    find_library(YS_LIBRARY
-        NAMES yascli libyascli
-        PATHS
-            ${YASHANDB_LIBRARY}
-            ${YASHANDB_ROOT}/lib
-            /root/yashandb-client/lib
-            /home/yashan/install/lib
-        PATH_SUFFIXES lib
-        NO_DEFAULT_PATH
-    )
-    if (NOT YS_LIBRARY AND YASHANDB_LIBRARY)
-        if (EXISTS ${YASHANDB_LIBRARY})
-            set(YS_LIBRARY ${YASHANDB_LIBRARY})
-        endif()
-    endif()
-
-    if (NOT YASHANDB_INCLUDE_DIR)
-        message(FATAL_ERROR "YashanDB yacli.h not found! Set -DYASHANDB_INCLUDE_DIR=/path/to/include or -DWITH_YASHANDB=OFF")
-    endif()
-    if (NOT YS_LIBRARY)
-        message(FATAL_ERROR "libyascli (YashanDB client) not found! Set -DYASHANDB_LIBRARY=/path/to/libyascli.so or -DWITH_YASHANDB=OFF")
-    endif()
-    message(STATUS "Found YashanDB includes: ${YASHANDB_INCLUDE_DIR}")
-    message(STATUS "Found libyascli: ${YS_LIBRARY}")
-    include_directories(${YASHANDB_INCLUDE_DIR})
+# 查找 libpq
+find_library(YS_LIBRARY 
+    yascli PATHS 
+    /root/yashandb-client/lib
+    PATH_SUFFIXES lib
+)
+if (NOT YS_LIBRARY)
+    message(FATAL_ERROR "libyascli (YashanDB client) not found!")
 else()
-    message(STATUS "YashanDB client support disabled")
-    set(YS_LIBRARY "")
+    message(STATUS "Found libyascli: ${YS_LIBRARY}")
 endif()
 
 
